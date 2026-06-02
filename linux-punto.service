@@ -1,0 +1,23 @@
+[Unit]
+Description=linux-punto (Punto Switcher для X11/KDE)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Поправь путь, если проект лежит в другом месте:
+ExecStart=/usr/bin/python3 %h/Projects/sovit/linux-punto/punto.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+
+# Установка (альтернатива тумблеру «Запускать при входе» в настройках):
+#   mkdir -p ~/.config/systemd/user
+#   cp linux-punto.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now linux-punto.service
+# На X11 демону нужен DISPLAY — если сервис не видит дисплей, добавь в [Service]:
+#   Environment=DISPLAY=:0
+# Обычно plasma импортирует окружение в graphical-session.target автоматически.
