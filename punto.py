@@ -942,6 +942,16 @@ def switch_layout_to_script(text):
 # Автодетект ошибочной раскладки на лету (#1)
 # ---------------------------------------------------------------------------
 
+def has_ru_dict():
+    """Установлен ли русский словарь aspell."""
+    try:
+        out = subprocess.run(["aspell", "dicts"], capture_output=True,
+                             timeout=3).stdout.decode("utf-8", "replace")
+        return any(ln.strip() == "ru" for ln in out.splitlines())
+    except Exception:
+        return False
+
+
 class WordChecker:
     """Проверка слова по словарю через постоянный процесс aspell (en/ru)."""
 
@@ -2143,9 +2153,47 @@ def run_with_tray(x, cfg, grabbed):
         vm.addWidget(chk_switch)
         vm.addWidget(chk_autostart)
         vm.addWidget(chk_autodetect)
-        vm.addWidget(QtWidgets.QLabel(
+        ad_hint = QtWidgets.QLabel(
             "<span style='color:gray'>исправляет слово сразу после пробела, "
-            "если набрано не в той раскладке. Нужен <b>aspell-ru</b>.</span>"))
+            "если набрано не в той раскладке. Нужен <b>aspell-ru</b>.</span>")
+        ad_hint.setWordWrap(True)
+        vm.addWidget(ad_hint)
+
+        def install_dict():
+            chk_autodetect.setEnabled(False)
+            ad_hint.setText("<span style='color:gray'>устанавливаю словарь "
+                            "(введи пароль в окне)…</span>")
+            proc = QtCore.QProcess(dlg)
+
+            def done(code, _status):
+                chk_autodetect.setEnabled(True)
+                if code == 0 and has_ru_dict():
+                    ad_hint.setText("<span style='color:#27ae60'>словарь "
+                                    "установлен ✓</span>")
+                    chk_autodetect.setChecked(True)
+                else:
+                    err = bytes(proc.readAllStandardError()).decode(
+                        "utf-8", "replace").strip()
+                    QtWidgets.QMessageBox.warning(
+                        dlg, "Не установилось",
+                        err[-400:] or "Не удалось установить aspell-ru.")
+                    chk_autodetect.setChecked(False)
+
+            proc.finished.connect(done)
+            proc.start("pkexec", ["apt-get", "install", "-y", "aspell-ru"])
+
+        def on_autodetect_toggled(checked):
+            if checked and not has_ru_dict():
+                r = QtWidgets.QMessageBox.question(
+                    dlg, "Нужен словарь",
+                    "Для автоисправления нужен русский словарь (aspell-ru).\n"
+                    "Установить сейчас? Потребуется ввести пароль.")
+                if r == QtWidgets.QMessageBox.Yes:
+                    install_dict()
+                else:
+                    chk_autodetect.setChecked(False)
+
+        chk_autodetect.toggled.connect(on_autodetect_toggled)
 
         box = QtWidgets.QGroupBox("Проверка транслитерации")
         bl = QtWidgets.QVBoxLayout(box)
