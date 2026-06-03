@@ -35,8 +35,11 @@ DEFAULT_CONFIG = {
     #   два+ модификатора        — "Ctrl+Shift", "Alt+Shift" (чистый аккорд,
     #                              срабатывает на отпускание, как в Punto)
     "hotkey": "Pause",
-    # Показывать всплывающее уведомление при действии.
-    "notify": False,
+    # Уведомления: главный тумблер + точечно по типам действий.
+    "notify": False,          # выключает/включает все тосты сразу
+    "notify_switch": True,    # тост при переключении раскладки
+    "notify_fix": True,       # тост при исправлении текста
+    "notify_copy": True,      # тост при копировании из истории
     # После исправления выделенного текста ещё и переключить раскладку,
     # чтобы продолжать печатать в правильной.
     "switch_layout_after_fix": False,
@@ -54,8 +57,8 @@ DEFAULT_CONFIG = {
 # Состояние времени выполнения (меняется из меню трея).
 STATE = {"enabled": True}
 
-# Трекер каретки/выделения (AT-SPI); ставится в run_with_tray.
-CARET = {"tracker": None}
+# Трекер каретки/выделения (AT-SPI) и получение выделения наших окон (Qt).
+CARET = {"tracker": None, "own_sel": None}
 
 
 def log(*a):
@@ -789,41 +792,75 @@ class X11Backend:
     def active_window_class(self):
         return self.window_class(self.active_window())
 
+    def _window_pid(self, win):
+        """_NET_WM_PID окна (0, если нет)."""
+        if not win:
+            return 0
+        try:
+            atom = x11.XInternAtom(self.dpy, b"_NET_WM_PID", True)
+            if not atom:
+                return 0
+            a_type = ctypes.c_ulong()
+            a_fmt = ctypes.c_int()
+            nitems = ctypes.c_ulong()
+            after = ctypes.c_ulong()
+            prop = ctypes.c_void_p()
+            st = x11.XGetWindowProperty(
+                self.dpy, win, atom, 0, 1, False, 6,  # XA_CARDINAL
+                ctypes.byref(a_type), ctypes.byref(a_fmt),
+                ctypes.byref(nitems), ctypes.byref(after), ctypes.byref(prop))
+            pid = 0
+            if st == 0 and prop and nitems.value > 0:
+                pid = int(ctypes.cast(prop, ctypes.POINTER(ctypes.c_ulong))[0])
+            if prop:
+                x11.XFree(prop)
+            return pid
+        except Exception:
+            return 0
+
     def selection_in_active(self):
-        """Текст PRIMARY-выделения, если оно принадлежит активному окну,
-        иначе ''. Неразрушающе (без синтетических нажатий). Проверка владельца
-        отсекает «старое» выделение из другого приложения."""
+        """Текст PRIMARY-выделения, если оно принадлежит активному приложению
+        (сравнение _NET_WM_PID владельца и активного окна — ловит Chrome/GTK,
+        у которых владелец выделения — скрытое окно, и отсекает чужое app).
+        Неразрушающе, без синтетических нажатий."""
         try:
             owner = x11.XGetSelectionOwner(self.dpy, XA_PRIMARY)
             active = self.active_window()
             if not owner or not active:
-                dbg("PRIMARY owner=%s active=%s" % (owner, active))
                 return ""
-            w = owner
-            found = False
-            for _ in range(40):  # активное окно должно быть предком владельца
-                if w == active:
-                    found = True
-                    break
-                root_r = ctypes.c_ulong()
-                parent_r = ctypes.c_ulong()
-                ch = ctypes.POINTER(ctypes.c_ulong)()
-                nch = ctypes.c_uint()
-                ok = x11.XQueryTree(self.dpy, w, ctypes.byref(root_r),
-                                    ctypes.byref(parent_r), ctypes.byref(ch),
-                                    ctypes.byref(nch))
-                if ch:
-                    x11.XFree(ch)
-                if not ok:
-                    break
-                parent = parent_r.value
-                if not parent or parent == self.root or parent == w:
-                    break
-                w = parent
-            dbg("PRIMARY owner=%#x active=%#x found=%s" % (owner, active, found))
-            if not found:
+            pid_active = self._window_pid(active)
+            pid_owner = self._window_pid(owner)
+            if not pid_owner:  # владелец — скрытое окно, ищем PID на его top-level
+                w = owner
+                for _ in range(40):
+                    root_r = ctypes.c_ulong()
+                    parent_r = ctypes.c_ulong()
+                    ch = ctypes.POINTER(ctypes.c_ulong)()
+                    nch = ctypes.c_uint()
+                    if not x11.XQueryTree(self.dpy, w, ctypes.byref(root_r),
+                                          ctypes.byref(parent_r),
+                                          ctypes.byref(ch), ctypes.byref(nch)):
+                        break
+                    if ch:
+                        x11.XFree(ch)
+                    parent = parent_r.value
+                    if not parent or parent == self.root or parent == w:
+                        break
+                    w = parent
+                    pid_owner = self._window_pid(w)
+                    if pid_owner:
+                        break
+            dbg("PRIMARY pid_owner=%s pid_active=%s" % (pid_owner, pid_active))
+            # отвергаем только если ДОКАЗАНО чужое (PID известен и отличается);
+            # если PID владельца не определить (Chrome/браузеры со «скрытым»
+            # окном-владельцем) — доверяем PRIMARY.
+            if pid_owner and pid_active and pid_owner != pid_active:
                 return ""
-            return clip_get("primary")
+            txt = clip_get("primary")
+            if not txt:  # Chrome бывает отвечает не сразу — один ретрай
+                time.sleep(0.05)
+                txt = clip_get("primary")
+            return txt
         except Exception as e:
             log("selection_in_active error: %r" % e)
             return ""
@@ -892,13 +929,21 @@ def _ensure_iface():
     return _dbus_iface
 
 
+_layouts_cache = {"list": None}
+
+
+def _layouts_list():
+    """Список раскладок (кэшируется — почти не меняется; меньше D-Bus)."""
+    if _layouts_cache["list"] is None:
+        _layouts_cache["list"] = _ensure_iface().getLayoutsList()
+    return _layouts_cache["list"]
+
+
 def current_layout_code():
     """Возвращает короткий код текущей раскладки, напр. 'us' / 'ru'."""
     try:
-        i = _ensure_iface()
-        idx = int(i.getLayout())
-        layouts = i.getLayoutsList()
-        return str(layouts[idx][0])
+        idx = int(_ensure_iface().getLayout())
+        return str(_layouts_list()[idx][0])
     except Exception:
         return "?"
 
@@ -906,9 +951,8 @@ def current_layout_code():
 def current_layout_name():
     """Полное имя текущей раскладки, напр. 'Russian' / 'English (US)'."""
     try:
-        i = _ensure_iface()
-        idx = int(i.getLayout())
-        row = i.getLayoutsList()[idx]
+        idx = int(_ensure_iface().getLayout())
+        row = _layouts_list()[idx]
         return str(row[2]) or str(row[0]).upper()
     except Exception:
         return current_layout_code().upper()
@@ -962,6 +1006,11 @@ def notify(msg):
         pass
 
 
+def should_notify(cfg, kind):
+    """Главный тумблер notify + точечный notify_<kind>."""
+    return bool(cfg.get("notify")) and bool(cfg.get("notify_" + kind, True))
+
+
 # ---------------------------------------------------------------------------
 # Позиция каретки через AT-SPI (для бейджа у поля ввода, #10)
 # ---------------------------------------------------------------------------
@@ -980,6 +1029,8 @@ class CaretTracker:
         self._loop = None
         self._focused = None  # последний активный текстовый объект (только AT-SPI-поток)
         self._focused_ts = 0.0
+        self._last_extent = 0.0  # троттлинг дорогого расчёта позиции каретки
+        self.paused = False      # на паузе, пока открыты наши окна (нет лагов)
 
     def start(self):
         try:
@@ -1002,9 +1053,10 @@ class CaretTracker:
             self._ctx = GLib.MainContext.new()
             self._ctx.push_thread_default()
             Atspi.init()
+            # только текстовые события (фокус опрашиваем on-demand) — меньше
+            # трафика по шине a11y.
             self._listeners = []
             for name in ("object:text-caret-moved",
-                         "object:state-changed:focused",
                          "object:text-selection-changed"):
                 l = Atspi.EventListener.new(self._on_event)
                 l.register(name)
@@ -1021,9 +1073,17 @@ class CaretTracker:
             src = event.source
             if src is None:
                 return
-            off = src.get_caret_offset()  # бросит, если объект без интерфейса Text
-            self._focused = src           # запоминаем активное текстовое поле
-            self._focused_ts = time.time()
+            now = time.time()
+            # дёшево: запоминаем активный текстовый объект (без D-Bus вызовов)
+            self._focused = src
+            self._focused_ts = now
+            # дорого (D-Bus к приложению): позицию каретки считаем не чаще раза
+            # в ~120мс; и совсем пропускаем, пока открыты наши окна (это и был
+            # источник лагов — синхронные D-Bus-запросы к нашему же UI-потоку).
+            if self.paused or now - self._last_extent < 0.12:
+                return
+            self._last_extent = now
+            off = src.get_caret_offset()
             r = src.get_character_extents(off, Atspi.CoordType.SCREEN)
             x, y, w, h = r.x, r.y, r.width, r.height
             if w == 0 and h == 0 and off > 0:  # каретка в конце строки
@@ -1032,8 +1092,7 @@ class CaretTracker:
             if h <= 0 or (x <= 0 and y <= 0):
                 return
             with self.lock:
-                self.pos = {"x": int(x), "y": int(y), "h": int(h),
-                            "ts": time.time()}
+                self.pos = {"x": int(x), "y": int(y), "h": int(h), "ts": now}
         except Exception:
             pass  # объект без интерфейса Text и т.п.
 
@@ -1109,12 +1168,32 @@ class CaretTracker:
 
 SENTINEL = "​⁣__punto_no_selection__⁣​"
 
+# Классы окон-терминалов: в них выделение не исправляем (Ctrl+V не заменяет
+# выделение в терминале — бессмысленно), только переключаем раскладку.
+_TERMINAL_HINTS = ("warp", "konsole", "alacritty", "kitty", "yakuake",
+                   "wezterm", "tilix", "terminator")
 
-def detect_selection(x):
+
+def _is_terminal(cls):
+    cls = (cls or "").lower()
+    return "term" in cls or any(t in cls for t in _TERMINAL_HINTS)
+
+
+# Чем определили выделение в последний раз (для очистки «залипшего» PRIMARY
+# после фикса — иначе повторное нажатие снова исправляет тот же текст).
+_DETECT = {"via_primary": False}
+
+
+def detect_selection(x, app="", own=False):
     """Текст активного выделения или '' (нет выделения). Неразрушающе:
-    сначала AT-SPI (Qt/GTK/браузеры), иначе PRIMARY-выделение активного окна.
-    Никаких синтетических Ctrl+C — чтобы не слать SIGINT в терминалы и не
-    копировать строку в редакторах вроде Kate."""
+    своё окно -> напрямую из Qt; иначе AT-SPI (Qt/GTK/браузеры с a11y), иначе
+    PRIMARY-выделение. Без синтетических Ctrl+C (SIGINT в терминалах и т.п.)."""
+    _DETECT["via_primary"] = False
+    if own:  # наше окно: берём выделение из Qt, без AT-SPI (иначе дедлок)
+        fn = CARET.get("own_sel")
+        sel = fn() if fn else ""
+        dbg("своё окно, Qt-выделение -> %r" % (sel[:40] if sel else sel))
+        return sel
     tracker = CARET["tracker"]
     if tracker is not None:
         info = tracker.query_selection()
@@ -1124,7 +1203,11 @@ def detect_selection(x):
         if info and info[0] == "nosel":
             return ""
         # ('unknown', ...)/None -> PRIMARY ниже
+    if _is_terminal(app):
+        dbg("терминал (%s) -> только переключение, PRIMARY не трогаем" % app)
+        return ""
     sel = x.selection_in_active()
+    _DETECT["via_primary"] = bool(sel)  # фикс пришёл из PRIMARY -> потом очистим
     dbg("PRIMARY активного окна -> %r" % (sel[:40] if sel else sel))
     return sel
 
@@ -1134,18 +1217,20 @@ def handle_hotkey(x, cfg):
     dbg("hotkey fired (enabled=%s)" % STATE["enabled"])
     if not STATE["enabled"]:
         return None
-    app = x.active_window_class()
+    aw = x.active_window()
+    app = x.window_class(aw)
     if app and any(d and d.lower() in app for d in cfg.get("disabled_apps", [])):
         dbg("приложение %r отключено -> пропуск" % app)
         return None
+    own = bool(aw) and x._window_pid(aw) == os.getpid()
 
-    selection = detect_selection(x)
+    selection = detect_selection(x, app, own)
     if not selection:
         # Ничего не выделено -> переключаем раскладку.
         dbg("нет выделения -> переключаю раскладку")
         switch_layout()
         STATS.record_switch()
-        if cfg["notify"]:
+        if should_notify(cfg, "switch"):
             notify("Раскладка → %s" % current_layout_name())
         return ("switch",)
 
@@ -1168,9 +1253,12 @@ def handle_hotkey(x, cfg):
         time.sleep(0.15)
         if cfg["switch_layout_after_fix"]:
             switch_layout()
+        if _DETECT["via_primary"]:
+            # гасим «залипший» PRIMARY, иначе следующее нажатие снова исправит
+            clip_set("", "primary")
         HISTORY.add(selection, fixed, app)
         STATS.record_fix(fixed)
-        if cfg["notify"]:
+        if should_notify(cfg, "fix"):
             notify("%s → %s" % (selection.strip()[:30], fixed.strip()[:30]))
         return ("fix", selection, fixed)
     except Exception:
@@ -1263,10 +1351,32 @@ def _qt_to_keysym_map(QtCore):
 
 
 def run_with_tray(x, cfg, grabbed):
+    # Наши окна — не a11y-провайдер: иначе (а) набор в полях грузит UI-поток
+    # через a11y, и (б) запрос выделения нашего же окна через AT-SPI = дедлок
+    # (главный поток ждёт ответа от себя же). Выделение в своих полях берём
+    # напрямую из Qt (own_selection). На AT-SPI-клиент для ЧУЖИХ окон не влияет.
+    os.environ["QT_ACCESSIBILITY"] = "0"
+    os.environ["NO_AT_BRIDGE"] = "1"
     from PyQt5 import QtWidgets, QtGui, QtCore
 
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    def own_selection():
+        """Выделенный текст в нашем сфокусированном поле (Qt, без D-Bus)."""
+        try:
+            w = app.focusWidget()
+            if w is None:
+                return ""
+            if hasattr(w, "selectedText"):        # QLineEdit
+                return w.selectedText() or ""
+            if hasattr(w, "textCursor"):           # QPlainTextEdit/QTextEdit
+                return w.textCursor().selectedText() or ""
+        except Exception:
+            pass
+        return ""
+
+    CARET["own_sel"] = own_selection
 
     # Всплывающий бейдж с раскладкой у курсора (#10).
     badge = QtWidgets.QLabel()
@@ -1284,6 +1394,14 @@ def run_with_tray(x, cfg, grabbed):
     caret_tracker = CaretTracker()
     caret_tracker.start()
     CARET["tracker"] = caret_tracker  # для detect_selection в handle_hotkey
+
+    # Пока открыты наши окна — ставим AT-SPI-трекер на паузу (иначе набор в
+    # полях настроек грузит UI-поток через a11y-самозапросы).
+    _dlg_count = {"n": 0}
+
+    def pause_caret(on):
+        _dlg_count["n"] = max(0, _dlg_count["n"] + (1 if on else -1))
+        caret_tracker.paused = _dlg_count["n"] > 0
 
     def flash_badge(code):
         if not cfg.get("badge"):
@@ -1328,10 +1446,15 @@ def run_with_tray(x, cfg, grabbed):
     act_quit = menu.addAction("Выход")
     tray.setContextMenu(menu)
 
+    _icon_state = {"key": None}
+
     def refresh():
         code = current_layout_code()
-        tray.setIcon(make_layout_icon(QtGui, QtCore, code, STATE["enabled"]))
-        act_layout.setText("Текущая раскладка: %s" % code.upper())
+        key = (code, STATE["enabled"])
+        if key != _icon_state["key"]:  # перерисовываем иконку только при смене
+            _icon_state["key"] = key
+            tray.setIcon(make_layout_icon(QtGui, QtCore, code, STATE["enabled"]))
+            act_layout.setText("Текущая раскладка: %s" % code.upper())
 
     def on_enabled(checked):
         STATE["enabled"] = checked
@@ -1341,7 +1464,7 @@ def run_with_tray(x, cfg, grabbed):
         switch_layout()
         STATS.record_switch()
         refresh()
-        if cfg["notify"]:
+        if should_notify(cfg, "switch"):
             notify("Раскладка → %s" % current_layout_name())
         flash_badge(current_layout_code())
 
@@ -1466,7 +1589,7 @@ def run_with_tray(x, cfg, grabbed):
 
     def do_copy(text):
         clip_set(text, "clipboard")
-        if cfg["notify"]:
+        if should_notify(cfg, "copy"):
             notify("Скопировано: %s" % text[:40])
 
     def do_paste(text):
@@ -1629,7 +1752,9 @@ def run_with_tray(x, cfg, grabbed):
         rebuild()
         hist_holder["dlg"] = dlg
         hist_holder["rebuild"] = rebuild
-        dlg.finished.connect(lambda *_: hist_holder.update(dlg=None, rebuild=None))
+        pause_caret(True)
+        dlg.finished.connect(lambda *_: (hist_holder.update(dlg=None, rebuild=None),
+                                         pause_caret(False)))
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -1682,7 +1807,9 @@ def run_with_tray(x, cfg, grabbed):
         rebuild()
         stats_holder["dlg"] = dlg
         stats_holder["rebuild"] = rebuild
-        dlg.finished.connect(lambda *_: stats_holder.update(dlg=None, rebuild=None))
+        pause_caret(True)
+        dlg.finished.connect(lambda *_: (stats_holder.update(dlg=None, rebuild=None),
+                                         pause_caret(False)))
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -1702,14 +1829,19 @@ def run_with_tray(x, cfg, grabbed):
         dlg.setWindowTitle("linux-punto — настройки")
         dlg.setWindowIcon(make_layout_icon(QtGui, QtCore,
                                            current_layout_code(), True))
-        dlg.setMinimumWidth(420)
-        v = QtWidgets.QVBoxLayout(dlg)
+        dlg.setMinimumSize(460, 380)
+        root = QtWidgets.QVBoxLayout(dlg)
+        tabs = QtWidgets.QTabWidget()
+        root.addWidget(tabs, 1)
 
-        header = QtWidgets.QLabel(
-            "<b>Punto Switcher для Linux</b><br>"
-            "<span style='color:gray'>переключение раскладки и исправление "
-            "текста по хоткею</span>")
-        v.addWidget(header)
+        # ===== Вкладка «Основное» =====
+        tab_main = QtWidgets.QWidget()
+        vm = QtWidgets.QVBoxLayout(tab_main)
+        tabs.addTab(tab_main, "Основное")
+
+        chk_enabled = QtWidgets.QCheckBox("Включён")
+        chk_enabled.setChecked(STATE["enabled"])
+        vm.addWidget(chk_enabled)
 
         pending = {"name": cfg["hotkey"]}
         form = QtWidgets.QFormLayout()
@@ -1721,14 +1853,14 @@ def run_with_tray(x, cfg, grabbed):
         hk_w = QtWidgets.QWidget()
         hk_w.setLayout(hk_row)
         form.addRow("Горячая клавиша:", hk_w)
-        v.addLayout(form)
+        vm.addLayout(form)
 
         hint = QtWidgets.QLabel(
             "<span style='color:gray'>варианты: одиночная клавиша "
             "(<b>Pause</b>), модификатор+клавиша (<b>Ctrl+Space</b>) или два "
             "модификатора (<b>Ctrl+Shift</b>) — нажми их и отпусти.</span>")
         hint.setWordWrap(True)
-        v.addWidget(hint)
+        vm.addWidget(hint)
 
         def on_captured(name):
             pending["name"] = name
@@ -1736,53 +1868,13 @@ def run_with_tray(x, cfg, grabbed):
 
         cap_btn.captured.connect(on_captured)
 
-        chk_enabled = QtWidgets.QCheckBox("Включён")
-        chk_enabled.setChecked(STATE["enabled"])
-        chk_notify = QtWidgets.QCheckBox("Показывать уведомления")
-        chk_notify.setChecked(cfg["notify"])
         chk_switch = QtWidgets.QCheckBox(
             "Переключать раскладку после исправления текста")
         chk_switch.setChecked(cfg["switch_layout_after_fix"])
-        chk_badge = QtWidgets.QCheckBox(
-            "Бейдж с раскладкой при переключении")
-        chk_badge.setChecked(cfg.get("badge", True))
-        chk_caret = QtWidgets.QCheckBox(
-            "    …показывать у каретки (иначе у курсора мыши)")
-        chk_caret.setChecked(cfg.get("badge_at_caret", True))
         chk_autostart = QtWidgets.QCheckBox("Запускать при входе в систему")
         chk_autostart.setChecked(autostart_enabled())
-        v.addWidget(chk_enabled)
-        v.addWidget(chk_notify)
-        v.addWidget(chk_switch)
-        v.addWidget(chk_badge)
-        v.addWidget(chk_caret)
-        v.addWidget(chk_autostart)
-        chk_badge.toggled.connect(chk_caret.setEnabled)
-        chk_caret.setEnabled(chk_badge.isChecked())
-
-        exc_box = QtWidgets.QGroupBox("Исключения — слова, которые не исправлять")
-        el = QtWidgets.QVBoxLayout(exc_box)
-        exc_edit = QtWidgets.QPlainTextEdit("\n".join(cfg.get("exceptions", [])))
-        exc_edit.setPlaceholderText("по одному слову на строку")
-        exc_edit.setMaximumHeight(56)
-        el.addWidget(exc_edit)
-        v.addWidget(exc_box)
-
-        app_box = QtWidgets.QGroupBox("Не работать в приложениях")
-        al = QtWidgets.QVBoxLayout(app_box)
-        apps_edit = QtWidgets.QPlainTextEdit(
-            "\n".join(cfg.get("disabled_apps", [])))
-        apps_edit.setMaximumHeight(56)
-        _known = sorted({it.get("app", "") for it in HISTORY.items
-                         if it.get("app")})
-        _ahint = "по одному на строку (подстрока WM_CLASS)."
-        if _known:
-            _ahint += " Известные: " + ", ".join(_known[:8])
-        apps_hint = QtWidgets.QLabel("<span style='color:gray'>%s</span>" % _ahint)
-        apps_hint.setWordWrap(True)
-        al.addWidget(apps_edit)
-        al.addWidget(apps_hint)
-        v.addWidget(app_box)
+        vm.addWidget(chk_switch)
+        vm.addWidget(chk_autostart)
 
         box = QtWidgets.QGroupBox("Проверка транслитерации")
         bl = QtWidgets.QVBoxLayout(box)
@@ -1794,8 +1886,69 @@ def run_with_tray(x, cfg, grabbed):
             lambda t: test_out.setText(transliterate(t) if t else "…"))
         bl.addWidget(test_in)
         bl.addWidget(test_out)
-        v.addWidget(box)
+        vm.addWidget(box)
+        vm.addStretch(1)
 
+        # ===== Вкладка «Уведомления» =====
+        tab_ntf = QtWidgets.QWidget()
+        vn = QtWidgets.QVBoxLayout(tab_ntf)
+        tabs.addTab(tab_ntf, "Уведомления")
+
+        chk_badge = QtWidgets.QCheckBox(
+            "Бейдж с раскладкой при переключении")
+        chk_badge.setChecked(cfg.get("badge", True))
+        chk_caret = QtWidgets.QCheckBox(
+            "    …показывать у каретки (иначе у курсора мыши)")
+        chk_caret.setChecked(cfg.get("badge_at_caret", True))
+        vn.addWidget(chk_badge)
+        vn.addWidget(chk_caret)
+        chk_badge.toggled.connect(chk_caret.setEnabled)
+        chk_caret.setEnabled(chk_badge.isChecked())
+
+        ntf_box = QtWidgets.QGroupBox("Тосты-уведомления")
+        ntf_box.setCheckable(True)          # заголовок-галка = главный тумблер
+        ntf_box.setChecked(cfg.get("notify", False))
+        nl = QtWidgets.QVBoxLayout(ntf_box)
+        chk_n_switch = QtWidgets.QCheckBox("при переключении раскладки")
+        chk_n_switch.setChecked(cfg.get("notify_switch", True))
+        chk_n_fix = QtWidgets.QCheckBox("при исправлении текста")
+        chk_n_fix.setChecked(cfg.get("notify_fix", True))
+        chk_n_copy = QtWidgets.QCheckBox("при копировании из истории")
+        chk_n_copy.setChecked(cfg.get("notify_copy", True))
+        nl.addWidget(chk_n_switch)
+        nl.addWidget(chk_n_fix)
+        nl.addWidget(chk_n_copy)
+        vn.addWidget(ntf_box)
+        vn.addStretch(1)
+
+        # ===== Вкладка «Правила» =====
+        tab_rules = QtWidgets.QWidget()
+        vr = QtWidgets.QVBoxLayout(tab_rules)
+        tabs.addTab(tab_rules, "Правила")
+
+        exc_box = QtWidgets.QGroupBox("Исключения — слова, которые не исправлять")
+        el = QtWidgets.QVBoxLayout(exc_box)
+        exc_edit = QtWidgets.QPlainTextEdit("\n".join(cfg.get("exceptions", [])))
+        exc_edit.setPlaceholderText("по одному слову на строку")
+        el.addWidget(exc_edit)
+        vr.addWidget(exc_box)
+
+        app_box = QtWidgets.QGroupBox("Не работать в приложениях")
+        al = QtWidgets.QVBoxLayout(app_box)
+        apps_edit = QtWidgets.QPlainTextEdit(
+            "\n".join(cfg.get("disabled_apps", [])))
+        _known = sorted({it.get("app", "") for it in HISTORY.items
+                         if it.get("app")})
+        _ahint = "по одному на строку (подстрока WM_CLASS)."
+        if _known:
+            _ahint += " Известные: " + ", ".join(_known[:8])
+        apps_hint = QtWidgets.QLabel("<span style='color:gray'>%s</span>" % _ahint)
+        apps_hint.setWordWrap(True)
+        al.addWidget(apps_edit)
+        al.addWidget(apps_hint)
+        vr.addWidget(app_box)
+
+        # ===== Кнопки (вне вкладок) =====
         btns = QtWidgets.QHBoxLayout()
         btns.addStretch(1)
         btn_save = QtWidgets.QPushButton("Сохранить")
@@ -1803,7 +1956,7 @@ def run_with_tray(x, cfg, grabbed):
         btn_close = QtWidgets.QPushButton("Закрыть")
         btns.addWidget(btn_save)
         btns.addWidget(btn_close)
-        v.addLayout(btns)
+        root.addLayout(btns)
 
         def do_save():
             new_name = pending["name"]
@@ -1849,7 +2002,10 @@ def run_with_tray(x, cfg, grabbed):
                         "Не удалось назначить «%s»:\n%s" % (new_name, e))
                     return
                 cfg["hotkey"] = new_name
-            cfg["notify"] = chk_notify.isChecked()
+            cfg["notify"] = ntf_box.isChecked()
+            cfg["notify_switch"] = chk_n_switch.isChecked()
+            cfg["notify_fix"] = chk_n_fix.isChecked()
+            cfg["notify_copy"] = chk_n_copy.isChecked()
             cfg["switch_layout_after_fix"] = chk_switch.isChecked()
             cfg["badge"] = chk_badge.isChecked()
             cfg["badge_at_caret"] = chk_caret.isChecked()
@@ -1871,7 +2027,9 @@ def run_with_tray(x, cfg, grabbed):
         btn_close.clicked.connect(dlg.close)
 
         dlg_holder["dlg"] = dlg
-        dlg.finished.connect(lambda *_: dlg_holder.update(dlg=None))
+        pause_caret(True)
+        dlg.finished.connect(lambda *_: (dlg_holder.update(dlg=None),
+                                         pause_caret(False)))
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -1940,7 +2098,7 @@ def run_with_tray(x, cfg, grabbed):
     # Периодически обновляем иконку (раскладку могли сменить и через Alt+Shift).
     timer = QtCore.QTimer()
     timer.timeout.connect(refresh)
-    timer.start(700)
+    timer.start(1200)
 
     refresh()
     tray.show()
