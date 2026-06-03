@@ -35,14 +35,18 @@ DEFAULT_CONFIG = {
     #   два+ модификатора        — "Ctrl+Shift", "Alt+Shift" (чистый аккорд,
     #                              срабатывает на отпускание, как в Punto)
     "hotkey": "Pause",
+    # Хоткей отката последнего исправления (пусто = выключен).
+    "undo_hotkey": "",
+    # Автодетект ошибочной раскладки на лету (нужен aspell + словари ru/en).
+    "autodetect": False,
     # Уведомления: главный тумблер + точечно по типам действий.
     "notify": False,          # выключает/включает все тосты сразу
     "notify_switch": True,    # тост при переключении раскладки
     "notify_fix": True,       # тост при исправлении текста
     "notify_copy": True,      # тост при копировании из истории
-    # После исправления выделенного текста ещё и переключить раскладку,
-    # чтобы продолжать печатать в правильной.
-    "switch_layout_after_fix": False,
+    # После исправления переключить раскладку под скрипт результата
+    # (кириллица -> ru, латиница -> en), чтобы продолжать печатать верно.
+    "switch_layout_after_fix": True,
     # Показывать всплывающий бейдж с раскладкой при переключении.
     "badge": True,
     # Показывать бейдж у каретки (AT-SPI); если позиция недоступна — у курсора.
@@ -585,11 +589,13 @@ class ModTapDetector:
 
 
 class XRecorder:
-    """Мониторит все нажатия через XRecord и зовёт on_fire на чистый аккорд."""
+    """Мониторит все нажатия через XRecord. Либо детектирует чистый аккорд
+    (on_fire), либо отдаёт каждую клавишу в on_key(etype, keycode)."""
 
-    def __init__(self, groups):
-        self.detector = ModTapDetector(groups)
+    def __init__(self, groups=None, on_key=None):
+        self.detector = ModTapDetector(groups) if groups else None
         self.on_fire = None
+        self.on_key = on_key
         self._busy = False
         self.ctrl_dpy = x11.XOpenDisplay(None)
         self.data_dpy = x11.XOpenDisplay(None)
@@ -625,7 +631,11 @@ class XRecorder:
                 etype = d.data[0] & 0x7F
                 kc = d.data[1]
                 if etype in (KeyPress, KeyPress + 1):
-                    if self.detector.feed(etype == KeyPress, kc) and self.on_fire:
+                    if self.on_key is not None:
+                        self.on_key(etype, kc)
+                    elif (self.detector
+                          and self.detector.feed(etype == KeyPress, kc)
+                          and self.on_fire):
                         dbg("чистый аккорд пойман -> срабатывание")
                         self._busy = True
                         try:
@@ -730,6 +740,38 @@ class X11Backend:
     def ctrl_v(self):
         self._tap(self.kc_ctrl, self.kc_v)
 
+    def kc_to_latin(self):
+        """Карта keycode -> латинская буква (us-раскладка) для разбора набора."""
+        m = {}
+        for ch in "abcdefghijklmnopqrstuvwxyz":
+            kc = x11.XKeysymToKeycode(self.dpy, x11.XStringToKeysym(ch.encode()))
+            if kc:
+                m[kc] = ch
+        return m
+
+    def backspace(self, n):
+        """n раз Backspace."""
+        bs = x11.XKeysymToKeycode(self.dpy, 0xFF08)  # XK_BackSpace
+        if not bs:
+            return
+        for _ in range(n):
+            xtst.XTestFakeKeyEvent(self.dpy, bs, True, 0)
+            xtst.XTestFakeKeyEvent(self.dpy, bs, False, 0)
+        x11.XFlush(self.dpy)
+
+    def select_left(self, n):
+        """Выделяет n символов влево (Shift+Left ×n) — для отката."""
+        shift = x11.XKeysymToKeycode(self.dpy, 0xFFE1)   # Shift_L
+        left = x11.XKeysymToKeycode(self.dpy, 0xFF51)    # XK_Left
+        if not shift or not left:
+            return
+        xtst.XTestFakeKeyEvent(self.dpy, shift, True, 0)
+        for _ in range(n):
+            xtst.XTestFakeKeyEvent(self.dpy, left, True, 0)
+            xtst.XTestFakeKeyEvent(self.dpy, left, False, 0)
+        xtst.XTestFakeKeyEvent(self.dpy, shift, False, 0)
+        x11.XFlush(self.dpy)
+
     def wait_key(self, ev):
         x11.XNextEvent(self.dpy, ctypes.byref(ev))
 
@@ -818,53 +860,6 @@ class X11Backend:
         except Exception:
             return 0
 
-    def selection_in_active(self):
-        """Текст PRIMARY-выделения, если оно принадлежит активному приложению
-        (сравнение _NET_WM_PID владельца и активного окна — ловит Chrome/GTK,
-        у которых владелец выделения — скрытое окно, и отсекает чужое app).
-        Неразрушающе, без синтетических нажатий."""
-        try:
-            owner = x11.XGetSelectionOwner(self.dpy, XA_PRIMARY)
-            active = self.active_window()
-            if not owner or not active:
-                return ""
-            pid_active = self._window_pid(active)
-            pid_owner = self._window_pid(owner)
-            if not pid_owner:  # владелец — скрытое окно, ищем PID на его top-level
-                w = owner
-                for _ in range(40):
-                    root_r = ctypes.c_ulong()
-                    parent_r = ctypes.c_ulong()
-                    ch = ctypes.POINTER(ctypes.c_ulong)()
-                    nch = ctypes.c_uint()
-                    if not x11.XQueryTree(self.dpy, w, ctypes.byref(root_r),
-                                          ctypes.byref(parent_r),
-                                          ctypes.byref(ch), ctypes.byref(nch)):
-                        break
-                    if ch:
-                        x11.XFree(ch)
-                    parent = parent_r.value
-                    if not parent or parent == self.root or parent == w:
-                        break
-                    w = parent
-                    pid_owner = self._window_pid(w)
-                    if pid_owner:
-                        break
-            dbg("PRIMARY pid_owner=%s pid_active=%s" % (pid_owner, pid_active))
-            # отвергаем только если ДОКАЗАНО чужое (PID известен и отличается);
-            # если PID владельца не определить (Chrome/браузеры со «скрытым»
-            # окном-владельцем) — доверяем PRIMARY.
-            if pid_owner and pid_active and pid_owner != pid_active:
-                return ""
-            txt = clip_get("primary")
-            if not txt:  # Chrome бывает отвечает не сразу — один ретрай
-                time.sleep(0.05)
-                txt = clip_get("primary")
-            return txt
-        except Exception as e:
-            log("selection_in_active error: %r" % e)
-            return ""
-
     def activate(self, win):
         """Делаем окно активным (EWMH) + ставим фокус ввода."""
         if not win:
@@ -917,6 +912,192 @@ def switch_layout():
         dbg("раскладка переключена -> %s" % current_layout_code())
     except Exception as e:
         log("switch_layout ОШИБКА: %r" % e)
+
+
+# Коды кириллических раскладок (для выбора раскладки под исправленный текст).
+_CYR_LAYOUT_CODES = {"ru", "ua", "by", "bg", "kz", "rs", "sr", "mk", "mn", "kk"}
+
+
+def switch_layout_to_script(text):
+    """Ставит раскладку под скрипт текста: кириллица -> кириллическая
+    раскладка, латиница -> латинская. Чтобы после фикса продолжать печатать
+    в правильной раскладке."""
+    try:
+        cyr = any("Ѐ" <= ch <= "ӿ" for ch in text)
+        i = _ensure_iface()
+        layouts = _layouts_list()
+        cur = int(i.getLayout())
+        if (str(layouts[cur][0]).lower() in _CYR_LAYOUT_CODES) == cyr:
+            return  # уже подходящая раскладка
+        for idx, row in enumerate(layouts):
+            if (str(row[0]).lower() in _CYR_LAYOUT_CODES) == cyr:
+                i.setLayout(idx)
+                dbg("раскладка под текст -> %s" % str(row[0]))
+                return
+    except Exception as e:
+        log("switch_layout_to_script ОШИБКА: %r" % e)
+
+
+# ---------------------------------------------------------------------------
+# Автодетект ошибочной раскладки на лету (#1)
+# ---------------------------------------------------------------------------
+
+class WordChecker:
+    """Проверка слова по словарю через постоянный процесс aspell (en/ru)."""
+
+    def __init__(self):
+        self._procs = {}  # lang -> Popen или False (недоступен)
+
+    def _proc(self, lang):
+        if lang in self._procs:
+            return self._procs[lang]
+        name = "en" if lang == "en" else "ru"
+        try:
+            p = subprocess.Popen(
+                ["aspell", "-d", name, "-a", "--encoding=utf-8"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, bufsize=0)
+            p.stdout.readline()  # баннер версии
+            self._procs[lang] = p
+        except Exception as e:
+            log("aspell %s недоступен: %r" % (name, e))
+            self._procs[lang] = False
+        return self._procs[lang]
+
+    def available(self):
+        return bool(self._proc("en")) and bool(self._proc("ru"))
+
+    def valid(self, word, lang):
+        """True/False валидность слова, None если словарь недоступен."""
+        p = self._proc(lang)
+        if not p:
+            return None
+        try:
+            p.stdin.write(("^" + word + "\n").encode("utf-8"))
+            p.stdin.flush()
+            line = p.stdout.readline().decode("utf-8", "replace").strip()
+            p.stdout.readline()  # пустая строка-терминатор ответа
+            if not line:
+                return None
+            return line[0] in "*+-"   # * найдено, + по аффиксу, - составное
+        except Exception:
+            return None
+
+    def stop(self):
+        for p in self._procs.values():
+            if p:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+
+class AutoCorrector:
+    """Слушает набор (XRecord), на пробеле проверяет слово по словарю и, если
+    оно набрано не в той раскладке, заменяет на правильное + переключает язык."""
+
+    def __init__(self, x, cfg):
+        self.x = x
+        self.cfg = cfg
+        self.checker = WordChecker()
+        self.kc2char = x.kc_to_latin()
+        self.shift = 0
+        self.word = []          # латинские буквы текущего слова
+        self.rec = None
+        self._kc_space = x11.XKeysymToKeycode(x.dpy, 0x20)      # space
+        self._kc_bs = x11.XKeysymToKeycode(x.dpy, 0xFF08)      # BackSpace
+        self._kc_shift = {x11.XKeysymToKeycode(x.dpy, 0xFFE1),
+                          x11.XKeysymToKeycode(x.dpy, 0xFFE2)}
+
+    def start(self):
+        if not self.checker.available():
+            log("автодетект: aspell ru/en недоступны — выключено "
+                "(нужен 'sudo apt install aspell-ru')")
+            return False
+        try:
+            self.rec = XRecorder(on_key=self._on_key)
+            return True
+        except Exception as e:
+            log("автодетект: не удалось запустить XRecord: %r" % e)
+            return False
+
+    def fd(self):
+        return self.rec.fd() if self.rec else -1
+
+    def process(self):
+        if self.rec:
+            self.rec.process()
+
+    def stop(self):
+        if self.rec:
+            self.rec.stop()
+            self.rec = None
+        self.checker.stop()
+
+    def _on_key(self, etype, kc):
+        if etype != KeyPress:
+            return
+        if kc in self._kc_shift:
+            self.shift += 1   # неважно точное значение, >0 = зажат
+            return
+        if kc == self._kc_space:
+            self._process_word()
+            self.word = []
+            return
+        if kc == self._kc_bs:
+            if self.word:
+                self.word.pop()
+            return
+        ch = self.kc2char.get(kc)
+        if ch:
+            self.word.append(ch.upper() if self.shift else ch)
+            self.shift = 0
+        else:
+            self.word = []    # не-буква (цифра/пунктуация/стрелка) -> сброс
+
+    def _process_word(self):
+        if not self.cfg.get("autodetect") or len(self.word) < 3:
+            return
+        us = "".join(self.word)
+        if not us.isalpha():
+            return
+        cur_ru = current_layout_code() in _CYR_LAYOUT_CODES
+        if cur_ru:
+            typed, t_lang, alt, a_lang = transliterate(us), "ru", us, "en"
+        else:
+            typed, t_lang, alt, a_lang = us, "en", transliterate(us), "ru"
+        v_typed = self.checker.valid(typed, t_lang)
+        v_alt = self.checker.valid(alt, a_lang)
+        dbg("автодетект %r: typed=%r(%s) alt=%r(%s)"
+            % (us, typed, v_typed, alt, v_alt))
+        if v_typed is False and v_alt is True:
+            self._correct(len(typed), alt)
+
+    def _correct(self, n, alt):
+        self.rec._busy = True   # игнорируем свои синтетические клавиши
+        saved = clip_get("clipboard")
+        try:
+            self.x.clear_modifiers()
+            self.x.backspace(n + 1)            # слово + пробел
+            time.sleep(0.03)
+            clip_set(alt + " ", "clipboard")
+            time.sleep(0.04)
+            self.x.clear_modifiers()
+            self.x.ctrl_v()
+            time.sleep(0.12)
+            switch_layout_to_script(alt)
+            HISTORY.add(self.word and "".join(self.word) or "", alt, "auto")
+            STATS.record_fix(alt)
+            log("автодетект исправил -> %r" % alt)
+        except Exception:
+            import traceback
+            log("автодетект ОШИБКА:\n" + traceback.format_exc())
+        finally:
+            if saved:
+                time.sleep(0.02)
+                clip_set(saved, "clipboard")
+            self.word = []
+            self.rec._busy = False
 
 
 def _ensure_iface():
@@ -1179,16 +1360,69 @@ def _is_terminal(cls):
     return "term" in cls or any(t in cls for t in _TERMINAL_HINTS)
 
 
-# Чем определили выделение в последний раз (для очистки «залипшего» PRIMARY
-# после фикса — иначе повторное нажатие снова исправляет тот же текст).
-_DETECT = {"via_primary": False}
+# Последнее исправление — для отката (#2): что заменили и когда.
+_UNDO = {"orig": None, "fixed": None, "ts": 0.0}
+
+
+def handle_undo(x, cfg):
+    """Откат последнего исправления: выделяет вставленный текст и возвращает
+    исходный. Работает сразу после фикса (пока курсор за вставленным текстом)."""
+    lf = _UNDO
+    if not lf["fixed"] or (time.time() - lf["ts"]) > 120:
+        dbg("откат: нечего откатывать")
+        return None
+    orig, fixed = lf["orig"], lf["fixed"]
+    dbg("откат: %r -> %r" % (fixed[:30], orig[:30]))
+    saved = clip_get("clipboard")
+    try:
+        x.clear_modifiers()
+        x.select_left(len(fixed))        # выделяем вставленное
+        time.sleep(0.05)
+        clip_set(orig, "clipboard")
+        time.sleep(0.05)
+        x.clear_modifiers()
+        x.ctrl_v()                        # заменяем на исходное
+        time.sleep(0.15)
+        if cfg.get("switch_layout_after_fix", True):
+            switch_layout_to_script(orig)  # раскладка обратно под исходный текст
+        lf["fixed"] = None                # один откат
+        if should_notify(cfg, "fix"):
+            notify("Откат: %s" % orig.strip()[:30])
+        return ("undo",)
+    except Exception:
+        import traceback
+        log("ОШИБКА в handle_undo:\n" + traceback.format_exc())
+        return None
+    finally:
+        if saved:
+            time.sleep(0.02)
+            clip_set(saved, "clipboard")
+
+
+def _copy_selection(x):
+    """Маркер + Ctrl+C: ловит ТЕКУЩЕЕ выделение (не «залипший» PRIMARY).
+    Безопасно — вызывается только для не-терминалов и не-a11y приложений."""
+    saved = clip_get("clipboard")
+    try:
+        clip_set(SENTINEL, "clipboard")
+        time.sleep(0.03)
+        x.clear_modifiers()
+        x.ctrl_c()
+        time.sleep(0.12)
+        got = clip_get("clipboard")
+        dbg("Ctrl+C -> %r" % (got[:40] if got else got))
+        return "" if (not got or got == SENTINEL) else got
+    finally:
+        if saved:
+            time.sleep(0.02)
+            clip_set(saved, "clipboard")
 
 
 def detect_selection(x, app="", own=False):
-    """Текст активного выделения или '' (нет выделения). Неразрушающе:
-    своё окно -> напрямую из Qt; иначе AT-SPI (Qt/GTK/браузеры с a11y), иначе
-    PRIMARY-выделение. Без синтетических Ctrl+C (SIGINT в терминалах и т.п.)."""
-    _DETECT["via_primary"] = False
+    """Текст активного выделения или '' (нет выделения).
+    Своё окно -> Qt; AT-SPI (a11y-приложения); терминалы -> только переключение;
+    остальное -> маркер+Ctrl+C (надёжно отличает выделение от пустого поля,
+    в отличие от «залипшего» PRIMARY)."""
     if own:  # наше окно: берём выделение из Qt, без AT-SPI (иначе дедлок)
         fn = CARET.get("own_sel")
         sel = fn() if fn else ""
@@ -1202,14 +1436,11 @@ def detect_selection(x, app="", own=False):
             return info[1]
         if info and info[0] == "nosel":
             return ""
-        # ('unknown', ...)/None -> PRIMARY ниже
+        # ('unknown', ...)/None -> ниже
     if _is_terminal(app):
-        dbg("терминал (%s) -> только переключение, PRIMARY не трогаем" % app)
+        dbg("терминал (%s) -> только переключение" % app)
         return ""
-    sel = x.selection_in_active()
-    _DETECT["via_primary"] = bool(sel)  # фикс пришёл из PRIMARY -> потом очистим
-    dbg("PRIMARY активного окна -> %r" % (sel[:40] if sel else sel))
-    return sel
+    return _copy_selection(x)
 
 
 def handle_hotkey(x, cfg):
@@ -1251,11 +1482,9 @@ def handle_hotkey(x, cfg):
         x.clear_modifiers()
         x.ctrl_v()
         time.sleep(0.15)
-        if cfg["switch_layout_after_fix"]:
-            switch_layout()
-        if _DETECT["via_primary"]:
-            # гасим «залипший» PRIMARY, иначе следующее нажатие снова исправит
-            clip_set("", "primary")
+        if cfg.get("switch_layout_after_fix", True):
+            switch_layout_to_script(fixed)  # раскладка под исправленный текст
+        _UNDO.update(orig=selection, fixed=fixed, ts=time.time())  # для отката
         HISTORY.add(selection, fixed, app)
         STATS.record_fix(fixed)
         if should_notify(cfg, "fix"):
@@ -1419,7 +1648,13 @@ def run_with_tray(x, cfg, grabbed):
         badge.raise_()
         _badge_timer.start(900)
 
-    hk = {"g": grabbed}  # мутабельно: словарь grab (или None), меняется на лету
+    # Несколько хоткеев: main (исправление/переключение) + undo (откат).
+    HK = {"main": grabbed, "undo": None}
+    if cfg.get("undo_hotkey"):
+        try:
+            HK["undo"] = x.grab(cfg["undo_hotkey"])
+        except Exception as e:
+            log("хоткей отката «%s» недоступен: %r" % (cfg["undo_hotkey"], e))
     qt2keysym = _qt_to_keysym_map(QtCore)
     MODIFIER_KEYS = {QtCore.Qt.Key_Control, QtCore.Qt.Key_Shift,
                      QtCore.Qt.Key_Alt, QtCore.Qt.Key_Meta,
@@ -1868,13 +2103,49 @@ def run_with_tray(x, cfg, grabbed):
 
         cap_btn.captured.connect(on_captured)
 
+        # Хоткей отката (#2)
+        pending_undo = {"name": cfg.get("undo_hotkey", "")}
+        form_u = QtWidgets.QFormLayout()
+        undo_label = QtWidgets.QLabel("<b>%s</b>" % (cfg.get("undo_hotkey") or "—"))
+        cap_undo = CaptureButton()
+        clr_undo = QtWidgets.QPushButton("Сброс")
+        u_row = QtWidgets.QHBoxLayout()
+        u_row.addWidget(undo_label, 1)
+        u_row.addWidget(cap_undo)
+        u_row.addWidget(clr_undo)
+        u_w = QtWidgets.QWidget()
+        u_w.setLayout(u_row)
+        form_u.addRow("Хоткей отката:", u_w)
+        vm.addLayout(form_u)
+        vm.addWidget(QtWidgets.QLabel(
+            "<span style='color:gray'>отменяет последнее исправление "
+            "(сразу после него). Пусто = выключен.</span>"))
+
+        def on_undo_cap(name):
+            pending_undo["name"] = name
+            undo_label.setText("<b>%s</b>" % name)
+
+        def clr_undo_fn():
+            pending_undo["name"] = ""
+            undo_label.setText("<b>—</b>")
+
+        cap_undo.captured.connect(on_undo_cap)
+        clr_undo.clicked.connect(clr_undo_fn)
+
         chk_switch = QtWidgets.QCheckBox(
-            "Переключать раскладку после исправления текста")
-        chk_switch.setChecked(cfg["switch_layout_after_fix"])
+            "После исправления переключать раскладку под текст")
+        chk_switch.setChecked(cfg.get("switch_layout_after_fix", True))
         chk_autostart = QtWidgets.QCheckBox("Запускать при входе в систему")
         chk_autostart.setChecked(autostart_enabled())
+        chk_autodetect = QtWidgets.QCheckBox(
+            "Автоисправление раскладки на лету (по словарю)")
+        chk_autodetect.setChecked(cfg.get("autodetect", False))
         vm.addWidget(chk_switch)
         vm.addWidget(chk_autostart)
+        vm.addWidget(chk_autodetect)
+        vm.addWidget(QtWidgets.QLabel(
+            "<span style='color:gray'>исправляет слово сразу после пробела, "
+            "если набрано не в той раскладке. Нужен <b>aspell-ru</b>.</span>"))
 
         box = QtWidgets.QGroupBox("Проверка транслитерации")
         bl = QtWidgets.QVBoxLayout(box)
@@ -1958,50 +2229,54 @@ def run_with_tray(x, cfg, grabbed):
         btns.addWidget(btn_close)
         root.addLayout(btns)
 
+        def _safe_grab(spec):
+            if not spec:
+                return None
+            try:
+                return x.grab(spec)
+            except Exception:
+                return None
+
+        def regrab(name, new_spec, old_spec):
+            """Перевешивает хоткей name на new_spec. (ok, текст_ошибки)."""
+            try:
+                x.ungrab(HK[name])
+                HK[name] = x.grab(new_spec) if new_spec else None
+                wire_hotkeys()
+                return True, None
+            except PureModifierHotkey:
+                HK[name] = _safe_grab(old_spec)
+                wire_hotkeys()
+                return False, ("Нужно минимум два модификатора («%s» — мало).\n"
+                               "Например Ctrl+Shift или добавь обычную клавишу "
+                               "(Ctrl+Space)." % new_spec)
+            except HotkeyConflict:
+                HK[name] = _safe_grab(old_spec)
+                wire_hotkeys()
+                extra = find_kde_conflict(new_spec)
+                return False, ("Хоткей «%s» уже занят%s.\nВыбери другой."
+                               % (new_spec, " (%s)" % extra if extra else
+                                  " системой или другим приложением"))
+            except RuntimeError as e:
+                HK[name] = _safe_grab(old_spec)
+                wire_hotkeys()
+                return False, "Не удалось назначить «%s»:\n%s" % (new_spec, e)
+
         def do_save():
-            new_name = pending["name"]
-            old_name = cfg["hotkey"]
-            if new_name != old_name:
-                try:
-                    x.ungrab(hk["g"])
-                    hk["g"] = x.grab(new_name)
-                    wire_hotkey()
-                except PureModifierHotkey:
-                    try:
-                        hk["g"] = x.grab(old_name)
-                    except Exception:
-                        hk["g"] = None
-                    wire_hotkey()
-                    QtWidgets.QMessageBox.warning(
-                        dlg, "Так нельзя",
-                        "Нужно минимум два модификатора («%s» — мало).\n"
-                        "Например Ctrl+Shift или добавь обычную клавишу "
-                        "(Ctrl+Space)." % new_name)
+            new_main = pending["name"]
+            if new_main != cfg["hotkey"]:
+                ok, err = regrab("main", new_main, cfg["hotkey"])
+                if not ok:
+                    QtWidgets.QMessageBox.warning(dlg, "Горячая клавиша", err)
                     return
-                except HotkeyConflict:
-                    try:  # возвращаем прежний рабочий хоткей
-                        hk["g"] = x.grab(old_name)
-                    except Exception:
-                        hk["g"] = None
-                    wire_hotkey()
-                    extra = find_kde_conflict(new_name)
-                    msg = "Хоткей «%s» уже занят" % new_name
-                    msg += " (%s)" % extra if extra else \
-                        " системой или другим приложением"
-                    msg += ".\nВыбери другой."
-                    QtWidgets.QMessageBox.warning(dlg, "Конфликт хоткея", msg)
+                cfg["hotkey"] = new_main
+            new_undo = pending_undo["name"]
+            if new_undo != cfg.get("undo_hotkey", ""):
+                ok, err = regrab("undo", new_undo, cfg.get("undo_hotkey", ""))
+                if not ok:
+                    QtWidgets.QMessageBox.warning(dlg, "Хоткей отката", err)
                     return
-                except RuntimeError as e:
-                    try:
-                        hk["g"] = x.grab(old_name)
-                    except Exception:
-                        hk["g"] = None
-                    wire_hotkey()
-                    QtWidgets.QMessageBox.warning(
-                        dlg, "Ошибка",
-                        "Не удалось назначить «%s»:\n%s" % (new_name, e))
-                    return
-                cfg["hotkey"] = new_name
+                cfg["undo_hotkey"] = new_undo
             cfg["notify"] = ntf_box.isChecked()
             cfg["notify_switch"] = chk_n_switch.isChecked()
             cfg["notify_fix"] = chk_n_fix.isChecked()
@@ -2016,6 +2291,9 @@ def run_with_tray(x, cfg, grabbed):
                                     for w in apps_edit.toPlainText().splitlines()
                                     if w.strip()]
             set_autostart(chk_autostart.isChecked())
+            cfg["autodetect"] = chk_autodetect.isChecked()
+            wire_autodetect()
+            chk_autodetect.setChecked(cfg.get("autodetect", False))  # мог сняться
             STATE["enabled"] = chk_enabled.isChecked()
             act_enabled.setChecked(STATE["enabled"])
             save_config(cfg)
@@ -2051,10 +2329,10 @@ def run_with_tray(x, cfg, grabbed):
     # читаем сокет дисплея через QSocketNotifier — без отдельных потоков.
     ev = XKeyEvent()
 
-    def fire_hotkey():
+    def fire(action):
         res = None
         try:
-            res = handle_hotkey(x, cfg)
+            res = handle_undo(x, cfg) if action == "undo" else handle_hotkey(x, cfg)
         except Exception as e:
             print("handle error:", e, file=sys.stderr)
         refresh()
@@ -2066,34 +2344,61 @@ def run_with_tray(x, cfg, grabbed):
     def drain_x():
         while x11.XPending(x.dpy) > 0:
             x.wait_key(ev)
-            g = hk["g"]
-            if (ev.type == KeyPress and g and g.get("mode") == "key"
-                    and ev.keycode == g["keycode"]):
-                fire_hotkey()
+            if ev.type != KeyPress:
+                continue
+            for action, g in HK.items():
+                if g and g.get("mode") == "key" and ev.keycode == g["keycode"]:
+                    fire(action)
+                    break
 
     fd = x11.XConnectionNumber(x.dpy)
     notifier = QtCore.QSocketNotifier(fd, QtCore.QSocketNotifier.Read)
     notifier.activated.connect(lambda *_: drain_x())
 
-    # Хоткей из модификаторов (XRecord) — динамически подключаемый нотифаер.
-    rec_notifier = {"n": None}
+    # Хоткеи из модификаторов (XRecord) — по нотифаеру на каждый.
+    rec_notifiers = {}  # action -> QSocketNotifier
 
-    def wire_hotkey():
-        if rec_notifier["n"] is not None:
-            rec_notifier["n"].setEnabled(False)
-            rec_notifier["n"].deleteLater()
-            rec_notifier["n"] = None
-        g = hk["g"]
-        if g and g.get("mode") == "mod":
-            rec = g["recorder"]
-            rec.on_fire = fire_hotkey
-            n = QtCore.QSocketNotifier(rec.fd(), QtCore.QSocketNotifier.Read)
-            n.activated.connect(lambda *_: rec.process())
-            rec_notifier["n"] = n
-        log("хоткей активен: %s (режим %s)"
-            % (g.get("spec") if g else "—", g.get("mode") if g else "нет"))
+    def wire_hotkeys():
+        for n in rec_notifiers.values():
+            n.setEnabled(False)
+            n.deleteLater()
+        rec_notifiers.clear()
+        for action, g in HK.items():
+            if g and g.get("mode") == "mod":
+                rec = g["recorder"]
+                rec.on_fire = (lambda a=action: fire(a))
+                n = QtCore.QSocketNotifier(rec.fd(), QtCore.QSocketNotifier.Read)
+                n.activated.connect(lambda *_, r=rec: r.process())
+                rec_notifiers[action] = n
+        log("хоткеи: main=%s undo=%s"
+            % (HK["main"].get("spec") if HK["main"] else "—",
+               HK["undo"].get("spec") if HK["undo"] else "—"))
 
-    wire_hotkey()
+    wire_hotkeys()
+
+    # Автодетект ошибочной раскладки (#1) — отдельный XRecord-монитор набора.
+    autocorr = {"obj": None, "n": None}
+
+    def wire_autodetect():
+        if autocorr["n"] is not None:
+            autocorr["n"].setEnabled(False)
+            autocorr["n"].deleteLater()
+            autocorr["n"] = None
+        if autocorr["obj"] is not None:
+            autocorr["obj"].stop()
+            autocorr["obj"] = None
+        if cfg.get("autodetect"):
+            ac = AutoCorrector(x, cfg)
+            if ac.start():
+                autocorr["obj"] = ac
+                n = QtCore.QSocketNotifier(ac.fd(), QtCore.QSocketNotifier.Read)
+                n.activated.connect(lambda *_: ac.process())
+                autocorr["n"] = n
+                log("автодетект включён")
+            else:
+                cfg["autodetect"] = False  # нет словаря — снимаем флаг
+
+    wire_autodetect()
 
     # Периодически обновляем иконку (раскладку могли сменить и через Alt+Shift).
     timer = QtCore.QTimer()
@@ -2103,7 +2408,7 @@ def run_with_tray(x, cfg, grabbed):
     refresh()
     tray.show()
     # Если стартовый хоткей оказался занят — сообщаем и открываем настройки.
-    if hk["g"] is None:
+    if HK["main"] is None:
         extra = find_kde_conflict(cfg["hotkey"])
         notify("Хоткей «%s» занят%s. Выбери другой в настройках."
                % (cfg["hotkey"], " (%s)" % extra if extra else ""))
