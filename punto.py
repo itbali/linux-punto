@@ -1275,17 +1275,24 @@ class CaretTracker:
                 return
             self._last_extent = now
             off = src.get_caret_offset()
-            r = src.get_character_extents(off, Atspi.CoordType.SCREEN)
-            x, y, w, h = r.x, r.y, r.width, r.height
-            if w == 0 and h == 0 and off > 0:  # каретка в конце строки
-                r = src.get_character_extents(off - 1, Atspi.CoordType.SCREEN)
-                x, y, w, h = r.x, r.y, r.width, r.height
-            if h <= 0 or (x <= 0 and y <= 0):
+
+            def ext(o):
+                r = src.get_character_extents(o, Atspi.CoordType.SCREEN)
+                return r.x, r.y, r.width, r.height
+
+            x, y, w, h = ext(off)
+            if x <= 0 and y <= 0 and off > 0:   # пусто -> предыдущий символ
+                x, y, w, h = ext(off - 1)
+            if x <= 0 and y <= 0:
+                dbg("каретка: нет позиции (x=%s y=%s)" % (x, y))
                 return
+            if not (0 < h <= 200):   # некоторые приложения отдают кривую высоту
+                h = 18
             with self.lock:
                 self.pos = {"x": int(x), "y": int(y), "h": int(h), "ts": now}
-        except Exception:
-            pass  # объект без интерфейса Text и т.п.
+            dbg("каретка @ %d,%d (h=%d)" % (x, y, h))
+        except Exception as e:
+            dbg("каретка: нет Text/extents: %r" % e)
 
     def caret_xy(self, max_age=15.0):
         """(x, y) под кареткой, если позиция свежая; иначе None."""
@@ -1650,9 +1657,11 @@ def run_with_tray(x, cfg, grabbed):
         pt = caret_tracker.caret_xy() if cfg.get("badge_at_caret", True) else None
         if pt:
             bx, by = pt[0] + 4, pt[1]
+            dbg("бейдж -> у каретки %d,%d" % (bx, by))
         else:
             pos = QtGui.QCursor.pos()
             bx, by = pos.x() + 16, pos.y() + 16
+            dbg("бейдж -> у курсора (каретка недоступна)")
         badge.move(bx, by)
         badge.show()
         badge.raise_()
@@ -1820,7 +1829,7 @@ def run_with_tray(x, cfg, grabbed):
 
     def _esc(s):
         s = (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return s if len(s) <= 60 else s[:57] + "…"
+        return s if len(s) <= 500 else s[:497] + "…"
 
     def _fmt_ts(ts):
         try:
@@ -1883,6 +1892,7 @@ def run_with_tray(x, cfg, grabbed):
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         container = QtWidgets.QWidget()
         list_lay = QtWidgets.QVBoxLayout(container)
         list_lay.setSpacing(4)
@@ -1896,11 +1906,20 @@ def run_with_tray(x, cfg, grabbed):
                 if w:
                     w.deleteLater()
 
+        class HoverRow(QtWidgets.QFrame):
+            """Строка истории: пин виден при наведении (или если закреплён)."""
+            def __init__(self, pin_btn, pinned):
+                super().__init__()
+                self._pin = pin_btn
+                self._pinned = pinned
+
+            def enterEvent(self, e):
+                self._pin.setVisible(True)
+
+            def leaveEvent(self, e):
+                self._pin.setVisible(self._pinned)
+
         def make_row(item):
-            row = QtWidgets.QFrame()
-            row.setFrameShape(QtWidgets.QFrame.StyledPanel)
-            hl = QtWidgets.QHBoxLayout(row)
-            hl.setContentsMargins(6, 3, 6, 3)
             pin = QtWidgets.QToolButton()
             pin.setCheckable(True)
             pin.setChecked(bool(item.get("pinned")))
@@ -1908,9 +1927,18 @@ def run_with_tray(x, cfg, grabbed):
             pin.setToolTip("Закрепить (не удаляется при «Очистить»)")
             pin.toggled.connect(
                 lambda _c, it=item: (HISTORY.toggle_pin(it), rebuild()))
+            sp = pin.sizePolicy()           # держим место, чтобы строка не прыгала
+            sp.setRetainSizeWhenHidden(True)
+            pin.setSizePolicy(sp)
+
+            row = HoverRow(pin, bool(item.get("pinned")))
+            row.setFrameShape(QtWidgets.QFrame.StyledPanel)
+            hl = QtWidgets.QHBoxLayout(row)
+            hl.setContentsMargins(6, 3, 6, 3)
             lbl = QtWidgets.QLabel("<b>%s</b> &rarr; %s"
                                    % (_esc(item.get("original")),
                                       _esc(item.get("fixed"))))
+            lbl.setWordWrap(True)           # перенос длинного текста
             lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             lbl.setToolTip("%s → %s" % (item.get("original"), item.get("fixed")))
             ts = QtWidgets.QLabel(_fmt_ts(item.get("ts")))
@@ -1941,6 +1969,7 @@ def run_with_tray(x, cfg, grabbed):
             hl.addWidget(copy)
             hl.addWidget(paste)
             hl.addWidget(dele)
+            pin.setVisible(bool(item.get("pinned")))  # после layout — не сбросится
             return row
 
         def rebuild():
@@ -1960,8 +1989,17 @@ def run_with_tray(x, cfg, grabbed):
                 empty.setAlignment(QtCore.Qt.AlignCenter)
                 list_lay.addWidget(empty)
             else:
+                prev_pinned = None
                 for it in items:
+                    # линия между закреплёнными и остальными (в обычном порядке)
+                    if (not group_chk.isChecked() and prev_pinned
+                            and not it.get("pinned")):
+                        line = QtWidgets.QFrame()
+                        line.setFrameShape(QtWidgets.QFrame.HLine)
+                        line.setStyleSheet("color: #666;")
+                        list_lay.addWidget(line)
                     list_lay.addWidget(make_row(it))
+                    prev_pinned = bool(it.get("pinned"))
             list_lay.addStretch(1)
 
         def do_export():
